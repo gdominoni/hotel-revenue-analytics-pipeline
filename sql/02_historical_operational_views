@@ -1,0 +1,110 @@
+-- ============================================================================
+-- PROJECT: Dynamic Inventory Protection
+-- STEP 02: Generate Historical Operational Views
+-- OBJECTIVE: Reconstruct physical occupancy states, calculate arrival-date 
+--            pick-up curves, and track daily transaction activity.
+-- ============================================================================
+
+-- ============================================================================
+-- FILE 1: `daily_occupancy_history` (The House State)
+-- ============================================================================
+CREATE OR REPLACE TABLE `giovannidominoni.hotel_case.daily_occupancy_history` AS
+WITH calendar_spine AS (
+  SELECT calendar_date
+  FROM UNNEST(
+    GENERATE_DATE_ARRAY(
+      (SELECT MIN(arrival_date) FROM `giovannidominoni.hotel_case.bookings`),
+      (SELECT MAX(DATE_ADD(arrival_date, INTERVAL stays_in_weekend_nights + stays_in_week_nights DAY)) FROM `giovannidominoni.hotel_case.bookings`),
+      INTERVAL 1 DAY
+    )
+  ) AS calendar_date
+)
+SELECT
+  c.calendar_date,
+  b.hotel,
+  COUNT(b.arrival_date) AS rooms_occupied,
+  ROUND(SUM(b.adr), 2) AS daily_room_revenue
+FROM calendar_spine c
+INNER JOIN `giovannidominoni.hotel_case.bookings` b
+  ON c.calendar_date >= b.arrival_date
+  AND c.calendar_date < DATE_ADD(b.arrival_date, INTERVAL (b.stays_in_weekend_nights + b.stays_in_week_nights) DAY)
+WHERE b.is_canceled = 0 
+  AND (b.stays_in_weekend_nights + b.stays_in_week_nights) > 0 
+GROUP BY c.calendar_date, b.hotel;
+
+
+-- ============================================================================
+-- FILE 2: `booking_pickup_pace` (The Lead-Time Curve)
+-- ============================================================================
+CREATE OR REPLACE TABLE `giovannidominoni.hotel_case.booking_pickup_pace` AS
+SELECT
+  hotel,
+  arrival_date,
+  COUNTIF(is_canceled = 0) AS final_active_bookings,
+  -- Reconstruct the pace: How many rooms were already booked at key lead times
+  COUNTIF(lead_time >= 90 AND is_canceled = 0) AS bookings_picked_up_90d_out,
+  COUNTIF(lead_time >= 60 AND is_canceled = 0) AS bookings_picked_up_60d_out,
+  COUNTIF(lead_time >= 30 AND is_canceled = 0) AS bookings_picked_up_30d_out,
+  COUNTIF(lead_time >= 14 AND is_canceled = 0) AS bookings_picked_up_14d_out,
+  COUNTIF(lead_time >= 7 AND is_canceled = 0) AS bookings_picked_up_7d_out,
+  ROUND(SAFE_DIVIDE(COUNTIF(is_canceled = 1), COUNT(*)) * 100, 2) AS cumulative_cancellation_rate
+FROM `giovannidominoni.hotel_case.bookings`
+GROUP BY hotel, arrival_date;
+
+
+-- ============================================================================
+-- FILE 3: `daily_booking_activity_pickup` (The Daily Workload)
+-- ============================================================================
+CREATE OR REPLACE TABLE `giovannidominoni.hotel_case.daily_booking_activity_pickup` AS
+SELECT
+  booking_date,
+  hotel,
+  market_segment,
+  COUNTIF(is_canceled = 0) AS active_bookings_created_today,
+  COUNTIF(is_canceled = 1) AS cancellations_processed_today
+FROM `giovannidominoni.hotel_case.bookings`
+WHERE booking_date IS NOT NULL
+GROUP BY booking_date, hotel, market_segment;
+
+-- ============================================================================
+-- PROJECT: Dynamic Inventory Protection
+-- STEP 03: Feature Merging for Machine Learning
+-- OBJECTIVE: Consolidate individual bookings with daily occupancy, pacing,
+--            and daily transaction states into a single, flat ML-ready table.
+-- ============================================================================
+
+CREATE OR REPLACE TABLE `giovannidominoni.hotel_case.ml_ready_bookings` AS
+SELECT
+  -- 1. All original columns from your clean, reordered bookings table
+  b.*,
+
+  -- 2. House State on the Guest's Arrival Day (From daily_occupancy_history)
+  COALESCE(occ.rooms_occupied, 0) AS occupancy_on_arrival_date,
+  COALESCE(occ.daily_room_revenue, 0.0) AS total_hotel_revenue_on_arrival_date,
+
+  -- 3. The Arrival-Date Lead-Time Pace (From booking_pickup_pace)
+  COALESCE(pace.bookings_picked_up_90d_out, 0) AS cohort_booked_90d_out,
+  COALESCE(pace.bookings_picked_up_30d_out, 0) AS cohort_booked_30d_out,
+  COALESCE(pace.cumulative_cancellation_rate, 0.0) AS cohort_historical_cancel_rate,
+
+  -- 4. Market Activity on the Day the Guest Booked (From daily_booking_activity_pickup)
+  COALESCE(act.active_bookings_created_today, 0) AS segment_bookings_made_on_booking_date,
+  COALESCE(act.cancellations_processed_today, 0) AS segment_cancels_on_booking_date
+
+FROM `giovannidominoni.hotel_case.bookings` b
+
+-- Join 1: Fetch physical house count on their specific arrival night
+LEFT JOIN `giovannidominoni.hotel_case.daily_occupancy_history` occ
+  ON b.arrival_date = occ.calendar_date
+  AND b.hotel = occ.hotel
+
+-- Join 2: Fetch the pacing profile of their arrival date cohort
+LEFT JOIN `giovannidominoni.hotel_case.booking_pickup_pace` pace
+  ON b.arrival_date = pace.arrival_date
+  AND b.hotel = pace.hotel
+
+-- Join 3: Fetch how active their market segment was on the exact day they booked
+LEFT JOIN `giovannidominoni.hotel_case.daily_booking_activity_pickup` act
+  ON b.booking_date = act.booking_date
+  AND b.hotel = act.hotel
+  AND b.market_segment = act.market_segment;
